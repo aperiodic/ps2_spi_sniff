@@ -4,14 +4,16 @@ static int buff_size = 512;
 volatile byte buff[512];
 volatile int pos;
 volatile boolean buffer_full;
+int flushes;
 
 void setup(void) {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   pinMode(MISO, OUTPUT);
 
   pos = 0;
   buffer_full = false;
+  flushes = 0;
 
   // SPI Setup
   SPCR |= 1 << CPOL; // clock is idle high
@@ -34,9 +36,10 @@ void loop(void) {
   if (buffer_full) {
     SPCR &= ~(1 << SPIE); // disable SPI interrupts
     for (int i = 0; i < buff_size; i++) {
-      Serial.println(buff[i], DEC);
+      Serial.println(buff[i], HEX);
     }
-    Serial.println("buffer full!");
+    Serial.print("buffer flush ");
+    Serial.println(flushes++, DEC);
     pos = 0;
     buffer_full = false;
     SPCR |= 1 << SPIE; // enable SPI interrupts
