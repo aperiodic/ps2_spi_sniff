@@ -107,8 +107,8 @@ volatile enum ctlr_states ctlr_state;
 #define LOG_SIZE 128
 volatile byte* our_log[LOG_SIZE];
 volatile byte* their_log[LOG_SIZE];
-volatile byte bytes_unsynched;
-volatile byte our_log_head, our_log_tail, their_log_head, their_log_tail;
+volatile int bytes_unsynched;
+volatile int our_log_head, our_log_tail, their_log_head, their_log_tail;
 
 // When a byte comes in over SPI, we check to see if there's room in our
 // ring buffer log for it. If so, we throw it in there and increment the count
@@ -139,14 +139,14 @@ ISR (SPI_STC_vect) {
 // the beta node, then transmits all its unsynchronized bytes back.
 
 // returns number of bytes synchronized
-byte alpha_synchronize(void) {
+int alpha_synchronize(void) {
   // bail if we're not the alpha node
   if (our_id != alpha) return 0;
 
   // bail if we're already synched up
   if (bytes_unsynched == 0) return 0;
 
-  byte bytes_synched = 0;
+  int bytes_synched = 0;
   Wire.requestFrom(I2C_SLAVE_ADDRESS, bytes_unsynched);
 
   // potential for deadlock here, if the two nodes receive different amounts of
@@ -177,9 +177,9 @@ byte alpha_synchronize(void) {
 #endif
 
   // send our bytes
-  byte uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
+  int uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
   Wire.beginTransmission(I2C_SLAVE_ADDRESS);
-  for (byte i = 0; i < bytes_unsynched; i++) {
+  for (int i = 0; i < bytes_unsynched; i++) {
     Wire.write(our_log[(uhead + i) % LOG_SIZE]);
   }
   Wire.endTransmission();
@@ -197,8 +197,8 @@ byte alpha_synchronize(void) {
 // request for all of its unsynchronized bytes.
 
 void beta_synchronize_tx(void) {
-  byte uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
-  for (byte i = 0; i < bytes_unsynched, i++) {
+  int uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
+  for (int i = 0; i < bytes_unsynched, i++) {
     Wire.write(our_log[(uhead + i) % LOG_SIZE]);
   }
 }
@@ -226,7 +226,7 @@ void beta_synchronize_rx(int bytes_synched) {
   bytes_unsynched -= bytes_synched;
 }
 
-byte unsynched_head(byte unsynched, byte log_pos, byte log_size) {
+int unsynched_head(int unsynched, int log_pos, int log_size) {
   // log_pos is where next byte will end up, hence the -1. The '+ 2*log_size'
   // before the modulus ensures that 0 <= start < log_size.
   return ((log_pos - unsynched - 1) + 2*log_size) % log_size;
@@ -280,7 +280,7 @@ void setup(void) {
 
 void loop(void) {
   if (our_id == alpha) {
-    byte synched = alpha_synchronize();
+    int synched = alpha_synchronize();
 #ifdef DEBUG
     if (synched > 0) {
       Serial.print("Synched ");
