@@ -4,7 +4,7 @@
 #define DEBUG true
 
 #ifdef DEBUG
-  #define DEADLOCKED_LED 3
+  #define DEADLOCKED_LED 2
 #endif
 
 
@@ -22,6 +22,10 @@ enum id {
 };
 enum id our_id;
 #define ID_SELECT 8
+
+#ifdef DEBUG
+  #define ALPHA_LED 3
+#endif
 
 
 
@@ -103,7 +107,7 @@ volatile enum ctlr_states ctlr_state;
 #define LOG_SIZE 128
 volatile byte* our_log[LOG_SIZE];
 volatile byte* their_log[LOG_SIZE];
-volatile byte bytes_unsynced;
+volatile byte bytes_unsynched;
 volatile byte our_log_head, our_log_tail, their_log_head, their_log_tail;
 
 // When a byte comes in over SPI, we check to see if there's room in our
@@ -112,7 +116,7 @@ volatile byte our_log_head, our_log_tail, their_log_head, their_log_tail;
 // and if in debug mode we light up the SLOWSYNC_LED
 
 #ifdef DEBUG
-  #define SLOWSYNC_LED 2
+  #define SLOWSYNC_LED 4
 #endif
 
 // SPI Interrupt Handler
@@ -124,9 +128,9 @@ ISR (SPI_STC_vect) {
 #endif
   }
   our_log[our_log_pos++] = SPDR;
-  bytes_unsynced++;
-  if (bytes_unsynced > LOG_SIZE) {
-    bytes_unsynced = LOG_SIZE;
+  bytes_unsynched++;
+  if (bytes_unsynched > LOG_SIZE) {
+    bytes_unsynched = LOG_SIZE;
   }
 }
 
@@ -134,12 +138,16 @@ ISR (SPI_STC_vect) {
 // acts as the I2C master, and first requests all the unsynchronized bytes from
 // the beta node, then transmits all its unsynchronized bytes back.
 
-void alpha_synchronize(void) {
+// returns number of bytes synchronized
+byte alpha_synchronize(void) {
   // bail if we're not the alpha node
-  if (our_id != alpha) return;
+  if (our_id != alpha) return 0;
 
-  byte bytes_synced = 0;
-  Wire.requestFrom(I2C_SLAVE_ADDRESS, bytes_unsynced);
+  // bail if we're already synched up
+  if (bytes_unsynched == 0) return 0;
+
+  byte bytes_synched = 0;
+  Wire.requestFrom(I2C_SLAVE_ADDRESS, bytes_unsynched);
 
   // potential for deadlock here, if the two nodes receive different amounts of
   // bytes over SPI, which shouldn't happen unless one of them gets disconnected
@@ -147,7 +155,7 @@ void alpha_synchronize(void) {
 #ifdef DEBUG
   digitalWrite(DEADLOCKED_LED, HIGH);
 #endif
-  while (Wire.available() < bytes_unsynced) {}
+  while (Wire.available() < bytes_unsynched) {}
 
   while (Wire.available() > 0) {
     // if there's room in the log chuck it in
@@ -161,7 +169,7 @@ void alpha_synchronize(void) {
       digitalWrite(SLOWDUMP_LED, HIGH);
 #endif
     }
-    bytes_synced++;
+    bytes_synched++;
   }
 
 #ifdef DEBUG
@@ -169,33 +177,35 @@ void alpha_synchronize(void) {
 #endif
 
   // send our bytes
-  byte uhead = unsynced_head(bytes_unsynced, our_log_tail, LOG_SIZE);
+  byte uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
   Wire.beginTransmission(I2C_SLAVE_ADDRESS);
-  for (byte i = 0; i < bytes_unsynced; i++) {
+  for (byte i = 0; i < bytes_unsynched; i++) {
     Wire.write(our_log[(uhead + i) % LOG_SIZE]);
   }
   Wire.endTransmission();
 #ifdef DEBUG
-  if (bytes_unsynced != bytes_synced) {
+  if (bytes_unsynched != bytes_synched) {
     digitalWrite(UNSYNCHRONIZED_LED, HIGH);
   }
 #endif
-  bytes_unsynced -= bytes_synced;
+  bytes_unsynched -= bytes_synched;
+
+  return bytes_synched;
 }
 
 // The beta node acts as the I2C slave. First it must handle the master's
 // request for all of its unsynchronized bytes.
 
 void beta_synchronize_tx(void) {
-  byte uhead = unsynced_head(bytes_unsynced, our_log_tail, LOG_SIZE);
-  for (byte i = 0; i < bytes_unsynced, i++) {
+  byte uhead = unsynched_head(bytes_unsynched, our_log_tail, LOG_SIZE);
+  for (byte i = 0; i < bytes_unsynched, i++) {
     Wire.write(our_log[(uhead + i) % LOG_SIZE]);
   }
 }
 
 // Then it must receive all of the master's unsynchronized bytes.
 
-void beta_synchronize_rx(int bytes_synced) {
+void beta_synchronize_rx(int bytes_synched) {
   while (Wire.available() > 0) {
     if (their_log_head != (their_log_tail + 1) % LOG_SIZE) {
       their_log[their_log_tail++] = Wire.read();
@@ -209,39 +219,55 @@ void beta_synchronize_rx(int bytes_synced) {
   }
 
 #ifdef DEBUG
-  if (bytes_unsynced != bytes_synced) {
+  if (bytes_unsynched != bytes_synched) {
     digitalWrite(UNSYNCHRONIZED_LED, HIGH);
   }
 #endif
-  bytes_unsynced -= bytes_synced;
+  bytes_unsynched -= bytes_synched;
 }
 
-byte unsynced_head(byte unsynced, byte log_pos, byte log_size) {
-  // log_pos is where next byte will end up, hence the -1. The '+ 2*log_size
-  // % log_size' ensures that 0 <= start < log_size.
-  return ((log_pos - unsynced - 1) + 2*log_size) % log_size;
+byte unsynched_head(byte unsynched, byte log_pos, byte log_size) {
+  // log_pos is where next byte will end up, hence the -1. The '+ 2*log_size'
+  // before the modulus ensures that 0 <= start < log_size.
+  return ((log_pos - unsynched - 1) + 2*log_size) % log_size;
 }
 
 
+
+// Setup
+// =====
+//
+// Alright, now we've got to string everything together. In setup, we read our
+// id from the ID_SELECT pin, and then initialize the I2C bus and attach
+// interrupts accordingly. We also do the usual variable initialization and UART
+// (Serial), SPI, and pin direction configuration.
 
 void setup(void) {
-  Serial.begin(115200);
-
-  pinMode(MISO, OUTPUT);
-  pinMode(MASTER_SELECT, OUTPUT);
-
   pos = 0;
   buffer_full = false;
   flushes = 0;
 
-  delay(1);
-  are_master = (digitalRead(MASTER_SELECT) == HIGH);
+  Serial.begin(115200);
 
-  // I2C Setup
-  if (are_master) {
+  pinMode(MISO, INPUT); // both nodes are SPI slaves
+  pinMode(ID_SELECT, INPUT);
+
+  our_id = (digitalRead(ID_SELECT) == HIGH) ? alpha : beta;
+#ifdef DEBUG
+  if (our_id == alpha) {
+    digitalWrite(ALPHA_LED, HIGH);
+  }
+#endif
+
+  // Synchronization Setup
+  if (our_id == alpha) {
+    // alpha is the I2C master
     Wire.begin();
   } else {
+    // beta is the I2C slave
     Wire.begin(I2C_SLAVE_ADDRESS);
+    Wire.onRequest(beta_synchronize_tx);
+    Wire.onReceive(beta_synchronize_rx);
   }
 
   // SPI Setup
@@ -252,21 +278,19 @@ void setup(void) {
   SPCR |= 1 << SPE; // enable SPI
 }
 
-// I2C Master Received Interrupt
-void got_slave_bytes(void) {
-  byte count = Wire.available();
-}
-
 void loop(void) {
-  if (buffer_full) {
-    SPCR &= ~(1 << SPIE); // disable SPI interrupts
-    for (int i = 0; i < buff_size; i++) {
-      Serial.println(buff[i], HEX);
+  if (our_id == alpha) {
+    byte synched = alpha_synchronize();
+#ifdef DEBUG
+    if (synched > 0) {
+      Serial.print("Synched ");
+      Serial.print(synched, DEC);
+      if (synched == 1) {
+        Serial.println(" byte");
+      } else {
+        Serial.println(" bytes");
+      }
     }
-    Serial.print("buffer flush ");
-    Serial.println(flushes++, DEC);
-    pos = 0;
-    buffer_full = false;
-    SPCR |= 1 << SPIE; // enable SPI interrupts
+#endif
   }
 }
