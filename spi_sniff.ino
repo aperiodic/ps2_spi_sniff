@@ -107,31 +107,30 @@ volatile enum ctlr_states ctlr_state;
 #define LOG_SIZE 128
 volatile byte* our_log[LOG_SIZE];
 volatile byte* their_log[LOG_SIZE];
-volatile int bytes_unsynched;
 volatile int our_log_head, our_log_tail, their_log_head, their_log_tail;
 
 // When a byte comes in over SPI, we check to see if there's room in our
 // ring buffer log for it. If so, we throw it in there and increment the count
 // of unsynchronized bytes. If there's not room, we just drop it on the floor
-// and if in debug mode we light up the SLOWSYNC_LED
+// and if in debug mode we light up the SLOWSYNC_LED.
 
+volatile int bytes_unsynched, bytes_unreported;
 #ifdef DEBUG
   #define SLOWSYNC_LED 4
 #endif
 
 // SPI Interrupt Handler
 ISR (SPI_STC_vect) {
-  if (our_log_pos == LOG_SIZE) {
-    our_log_pos = 0;
+  if (our_log_head == (our_log_tail + 1) % LOG_SIZE) {
 #ifdef DEBUG
     digitalWrite(SLOWSYNC_LED, HIGH);
 #endif
+    return;
   }
-  our_log[our_log_pos++] = SPDR;
+
+  our_log[our_log_tail++] = SPDR;
+  our_log_tail %= LOG_SIZE;
   bytes_unsynched++;
-  if (bytes_unsynched > LOG_SIZE) {
-    bytes_unsynched = LOG_SIZE;
-  }
 }
 
 // The synchronization process is pretty straightforward. The node with id alpha
@@ -188,7 +187,9 @@ int alpha_synchronize(void) {
     digitalWrite(UNSYNCHRONIZED_LED, HIGH);
   }
 #endif
+
   bytes_unsynched -= bytes_synched;
+  bytes_unreported += bytes_synched;
 
   return bytes_synched;
 }
@@ -223,13 +224,20 @@ void beta_synchronize_rx(int bytes_synched) {
     digitalWrite(UNSYNCHRONIZED_LED, HIGH);
   }
 #endif
+
   bytes_unsynched -= bytes_synched;
+  bytes_unreported += bytes_synched;
 }
 
-int unsynched_head(int unsynched, int log_pos, int log_size) {
-  // log_pos is where next byte will end up, hence the -1. The '+ 2*log_size'
+int unsynched_head(int unsynched, int log_tail, int log_size) {
+  // log_tail is where next byte will end up, hence the -1. The '+ 2*log_size'
   // before the modulus ensures that 0 <= start < log_size.
-  return ((log_pos - unsynched - 1) + 2*log_size) % log_size;
+  return ((log_tail - unsynched - 1) + 2*log_size) % log_size;
+}
+
+int unreported_head(int unreported, int unsynched, int log_tail, int log_size) {
+  int uhead = unsynched_head(unsynched, log_tail, log_size);
+  return ((uhead - unreported) + log_size) % log_size;
 }
 
 
@@ -279,18 +287,35 @@ void setup(void) {
 }
 
 void loop(void) {
+  // first, synchronize
   if (our_id == alpha) {
+#ifdef DEBUG
+    digitalWrite(SYNCHRONIZATION_LED, HIGH);
+#endif
     int synched = alpha_synchronize();
 #ifdef DEBUG
-    if (synched > 0) {
-      Serial.print("Synched ");
-      Serial.print(synched, DEC);
-      if (synched == 1) {
-        Serial.println(" byte");
-      } else {
-        Serial.println(" bytes");
-      }
-    }
+    digitalWrite(SYNCHRONIZATION_LED, LOW);
 #endif
+  }
+
+  if (bytes_unreported > 0) {
+    int start = unreported_head(bytes_unreported,
+                                bytes_unsynched,
+                                our_log_tail,
+                                LOG_SIZE);
+    int bytes_reported = 0;
+
+    for (int i = 0; i < bytes_unreported; i++) {
+      if (our_id == alpha) {
+        Serial.print(our_log[(start + i) % LOG_SIZE], HEX);
+        Serial.print("/");
+        Serial.print(their_log[(start + i) % LOG_SIZE], HEX);
+      } else {
+        Serial.print(their_log[(start + i) % LOG_SIZE], HEX);
+        Serial.print("/");
+        Serial.print(our_log[(start + i) % LOG_SIZE], HEX);
+      }
+      bytes_reported += 1;
+    }
   }
 }
