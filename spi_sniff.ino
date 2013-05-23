@@ -33,10 +33,10 @@ enum id our_id;
 // =============================
 //
 // These are only for reference.
-#define SPI_CS 10
+#define SPI_KS 10
 #define SPI_MOSI 11
 #define SPI_MISO 12
-#define SPI_CLOCK 13
+#define SPI_KLOCK 13
 
 #define I2C_SDA A4
 #define I2C_SDL A5
@@ -84,6 +84,156 @@ enum ctlr_states {
 }
 
 volatile enum ctlr_states ctlr_state;
+
+
+// Event System
+// ============
+//
+// We'll be using an event-oriented programming paradigm where handlers are
+// registered for I/O events such as bytes coming in over SPI or I2C. The
+// handlers will be run in the main application thread and never in interrupt
+// handlers. The upside of this is that all of the application's handlers will
+// be atomic with respect to each other, which greatly simplifies the code. Only
+// the event system itself has to be concurrent.
+//
+// The event system will maintain two ring buffers for each I/O channel that it
+// supports, one for bytes coming in and another for those going out. For each
+// such buffer, we must also maintain counts of the number of successful read
+// and write operations on the buffer. The counts will allow us to calculate the
+// amount of room left in the buffer, and will be transformed into array indices
+// corresponding to the buffer's current head and tail when actually reading
+// from and writing to the array. In order to keep the transformation from
+// counts to indices as efficient as possible, the sizes of the buffers will be
+// restricted to powers of two.
+//
+// Since we will be reading from and writing to these buffers inside of
+// interrupt handlers, we must take care to implement these operations such that
+// the buffers can be concurrently written to and read from. Fortunately, each buffer
+// has only one producer and one consumer, which is either the application's
+// handlers or the event system's interrupt handlers, depending on the direction
+// of the buffer. This condition, referred to as the "1P1C guarantee", means
+// that each producer and consumer effectively has a mutex lock on either the
+// write count or the read count of the buffer, respectively, since there are no
+// other producers or consumers that might mutate them, and there is no need for
+// the producer to mutate the read count nor for the consumer to mutate the
+// write count (they need only observe them). This condition allows us to
+// enqueue onto and dequeue from the buffers without using locks or an atomic
+// compare-and-swap operation.
+
+bool buff_write(byte item, byte* buff, int capacity,
+                unsigned int* reads, unsigned int* writes) {
+  // First we must check that there is room left in the buffer, that is, that
+  // the buffer is not full. The number of items in the buffer can be
+  // calculated using the difference between the numbers of reads and writes on
+  // the buffer. We can't always just take the difference, though, since it's
+  // possible that the count of writes has overflown the unsigned int type and
+  // wrapped around, making the difference (writes - reads) negative. If this is
+  // the case, then we subtract the difference difference from the maximum
+  // possible unsigned integer value in order to find the count of items in the
+  // buffer (a proof of this procedure can be obtained by drawing the following
+  // diagram:
+  //
+  //                  diff         items
+  //         _________|_____    ___|__
+  //        /               \ /       \
+  //       |                 |         |
+  //       writes            reads     writes'
+  //       |                 |         | (where writes' % UINT_MAX = writes)
+  //       |                 |         |
+  //  |----|-----------------'----|----|----------------------|
+  //  |    |                      |    |                      |
+  //  |    '------------;---------|----'                      |
+  //  |                 |         |                           |
+  //  0                 |         UINT_MAX                    2 * UINT_MAX
+  //                    |
+  //                    UINT_MAX
+  //
+  //  and then observing that since diff + items = UINT_MAX, it follows that
+  //  UINT_MAX - diff = items).
+
+  unsigned int items;
+  int diff = *writes - *reads;
+  if (diff < 0) {
+    items = UINT_MAX - diff;
+  } else {
+    items = diff;
+  }
+
+  // If the number of items is equal to the capacity of the buffer, then it's
+  // full and we return false to indicate that the write failed.
+
+  if (items == capacity) return false;
+
+  // If we haven't bailed, we know that the buffer wasn't full sometime since we
+  // started executing this function. Due to the 1P1C guarantee, we know that
+  // nobody else can be attempting to write more things in to the buffer,
+  // meaning the buffer can't be any more full than when this function started,
+  // can't get any more full for the rest of the function, and we effectively have
+  // a mutex lock on the *writes argument, since the consumer never modifies it.
+
+  // Therefore, we can now calculate the current tail from the number of writes,
+  // insert the item there, and then increment the number of writes. Note the
+  // use of the assumption that capacity is a power of two here, in order to be
+  // able to use the fast bitwise modulo trick.
+
+  unsigned int tail = *writes & (capacity - 1);
+  buff[tail] = item;
+  *writes = *writes + 1;
+
+  // Return true to indicate that the write succeeded.
+  return true;
+}
+
+bool buff_read(byte* item, byte* buff, int capacity,
+               unsigned int* reads, unsigned int* writes) {
+  // For reading from the buffer, we just need to ensure that the buffer is
+  // nonempty. This is a bit easier to check than the nonfull condition needed
+  // for writing, since the buffer is only empty if there have been exactly the
+  // same number of read and write operations on it.
+
+  if (*writes == *reads) return false;
+
+  // By the same argument we used in buff_write above, we know that if we're at
+  // this point then the queue was nonempty, won't get any emptier, and we can
+  // mutate the read count without conflict.
+
+  unsigned int head = *reads & (capacity - 1);
+  *item = buff[head];
+  *reads = *reads + 1;
+
+  return true;
+}
+
+// As for the specific buffers, we'll have two for SPI and two for I2C. The SPI
+// buffers will be a bit larger (32 bytes, enough to hold an entire side of the
+// longest PS2 <-> Controller message).
+
+#define SPI_BUFFER_K 5
+#define SPI_BUFFER_SIZE (1 << SPI_BUFFER_K)
+volatile byte* spi_in_buff[SPI_BUFFER_SIZE];
+volatile unsigned int spi_in_buff_reads, spi_in_buff_writes;
+volatile byte* spi_out_buff[SPI_BUFFER_SIZE];
+volatile unsigned int spi_out_buff_reads, spi_out_buff_writes;
+
+#define I2C_BUFFER_K 3
+#define I2C_BUFFER_SIZE (1 << I2C_BUFFER_K)
+volatile byte* i2c_in_buff[I2C_BUFFER_SIZE];
+volatile unsigned int i2c_in_buff_reads, i2c_in_buff_writes;
+volatile byte* i2c_out_buff[I2C_BUFFER_SIZE];
+volatile unsigned int i2c_out_buff_reads, i2c_out_buff_writes;
+
+// Then we'll define specific read and write functions for each buffer using
+// the general buff_read and buff_write functions we've already defined.
+
+bool spi_in_read(byte* item) {
+  return buff_read(item, spi_in_buff, SPI_BUFFER_SIZE,
+                   &spi_in_buff_reads, &spi_in_buff_writes);
+}
+
+bool spi_in_write(byte item) {
+  return buff_write(item, spi_in_buff, SPI_BUFFER_SIZE,
+                    &spi_in_buff_reads, &spi_in_buff_writes);
+}
 
 
 
